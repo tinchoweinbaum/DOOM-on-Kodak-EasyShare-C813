@@ -12,6 +12,9 @@ class KODAK_ES_C813:
     ENDPOINT_BULK_IN = 0x83
     ENDPOINT_BULK_OUT = 0x4
     ENDPOINT_INTERRUPT_IN = 0x85
+    FIRST_BUFFER_SIZE = 12 # Tamaño en bytes de la supuesta "tabla de descriptores" que hay en la dirección 0x00B00000 (Donde la cámara carga el OS)
+    STORAGEID_RAM = 0x20001
+    STORAGEID_ROM = 0x10000
 
 def listarUsb():
     # Busca todos los dispositivos conectados
@@ -79,7 +82,7 @@ def send_ptp(dev, payload):
     try:
         # Enviamos los bytes (el payload ya debe venir armado con su Header PTP)
         dev.write(KODAK_ES_C813.ENDPOINT_BULK_OUT, payload)
-        print(f" Bytes enviados: {payload.hex()}")
+        print(f" Bytes enviados: {payload.hex()}\n")
     except usb.core.USBError as e:
         print(f"Error enviando PTP: {e}")
 
@@ -93,6 +96,38 @@ def receive_ptp(dev, size=1024):
     except usb.core.USBError as e:
         print(f"Error recibiendo PTP: {e}")
         return None
+    
+def build_ptp_packet(opcode, transaction_id=0, params=None):
+    """
+    Construye un paquete de comando PTP listo para enviar por USB.
+
+    :param opcode: El OpCode (ej: 0x1002 para OpenSession, 0x9003 para Serial)
+    :param transaction_id: ID incremental de la transacción
+    :param params: Lista de parámetros adicionales (máximo 5 según estándar PTP)
+    :return: Bytes empaquetados en Little Endian
+    """
+    if params is None:
+        params = []
+
+    # El header PTP base mide 12 bytes: 
+    # [Length (4b)] [Type (2b)] [OpCode (2b)] [TransactionID (4b)]
+    packet_length = 12 + (len(params) * 4)
+
+    # El 'Type' para comandos siempre es 1
+    packet_type = 1
+
+    # Construimos el formato para struct.pack:
+    # < : Little Endian
+    # I : Unsigned Int (4 bytes) - Para Length
+    # H : Unsigned Short (2 bytes) - Para Type
+    # H : Unsigned Short (2 bytes) - Para OpCode
+    # I : Unsigned Int (4 bytes) - Para TransactionID
+    # {len(params)}I : 'I' repetida por cada parámetro
+    fmt = f"<IHH I {len(params)}I"
+
+    packet = struct.pack(fmt, packet_length, packet_type, opcode, transaction_id, *params)
+
+    return packet
 
 def printDeviceInfo(dev):
     """
@@ -109,21 +144,6 @@ def printDeviceInfo(dev):
     if data:
         print(f"Respuesta Hex: {data.hex()}")
         print(f"Respuesta ASCII: {data.decode('ascii', errors='ignore')}")
-
-def tomar_foto(dev):
-    "Esta función hace creer al OS que está sacando una foto, pero realmente no lo hace por estar en modo PTP. Simplemente envía el opCode de 'sacar foto'"
-    print("\n--- DISPARANDO CÁMARA (0x100e) ---")
-    
-    # Paquete PTP: [Len: 20] (porque incluimos dos parámetros de 4 bytes cada uno)
-    # [Len][Type][OpCode][TransID][Param1][Param2]
-    # Param1: 0x00000000 (StorageID) | Param2: 0x00000000 (ObjectFormat)
-    header = b'\x14\x00\x00\x00\x01\x00\x0e\x10\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-    
-    send_ptp(dev, header)
-    res = receive_ptp(dev)
-    
-    if res:
-        print("Respuesta de la cámara:", res.hex())
 
 def test_vendor_codes(dev):
     # Los códigos que extrajimos de tu respuesta anterior
@@ -146,45 +166,141 @@ def test_vendor_codes(dev):
         else:
             print(f"El código {hex(code)} no devolvió nada o dio error.")
 
-# 1. Abrir sesión (ya sabemos que funciona)
-# 2. Intentar el Dump de RAM con la estructura que vimos en los headers
+def ejecutar_test_storage(dev):
+    try:
+        # 1. ABRIR SESIÓN (Obligatorio, 16 bytes)
+        # TransactionID debe ser 0. El SessionID es el parámetro (1).
+        print("\n--- [1] Abriendo Sesión (0x1002) ---")
+        pkt_open = build_ptp_packet(opcode=0x1002, transaction_id=0, params=[1])
+        send_ptp(dev, pkt_open)
+        
+        resp_open = receive_ptp(dev)
+        if not resp_open or resp_open[6:8] != b'\x01\x20': # 0x2001 es OK
+            print(f"Fallo al abrir sesión. Respuesta: {resp_open.hex() if resp_open else 'Nada'}")
+            return
 
-def dump_cam_os_segment(dev):
-    print("\n--- DUMPEANDO SEGMENTO CamOS A ARCHIVO ---")
-    
-    address = 0x00B00000 
-    size = 1024 # Vamos a pedir 1KB de nuevo
-    
-    cmd = struct.pack('<IHHII I', 20, 1, 0x900c, 3, address, size)
+        print("Sesión abierta con éxito (OK).")
+
+        # 2. GET STORAGE IDs (0x1004)
+        # Una vez abierta, el TransactionID debe subir a 1.
+        print("\n--- [2] Solicitando Storage IDs (0x1004) ---")
+        pkt_storage = build_ptp_packet(opcode=0x1004, transaction_id=1)
+        send_ptp(dev, pkt_storage)
+        
+        # Primero recibimos el DATA PHASE (donde están los IDs)
+        data_ids = receive_ptp(dev, size=1024)
+        # Luego recibimos el RESPONSE PHASE (el OK final)
+        resp_final = receive_ptp(dev, size=12)
+
+        if data_ids:
+            print(f"DATA recibida (Hex): {data_ids.hex()}")
+            # El estándar PTP dice que los primeros 4 bytes del payload 
+            # de datos son la cantidad de elementos en el array.
+            # Los bytes 12 en adelante (después del header de 12 bytes) son los IDs.
+            num_storages = struct.unpack("<I", data_ids[12:16])[0]
+            print(f"Número de unidades de almacenamiento: {num_storages}")
+            
+            for i in range(num_storages):
+                start = 16 + (i * 4)
+                s_id = struct.unpack("<I", data_ids[start:start+4])[0]
+                print(f" -> StorageID {i}: {hex(s_id)}")
+
+        # 3. CERRAR SESIÓN (Para no bloquear la cámara)
+        print("\n--- [3] Cerrando Sesión (0x1003) ---")
+        pkt_close = build_ptp_packet(opcode=0x1003, transaction_id=2)
+        send_ptp(dev, pkt_close)
+        receive_ptp(dev)
+
+    except Exception as e:
+        print(f"Error en el proceso: {e}")
+
+def check_storage_info(dev, storage_id):
+    """
+    Realiza un ciclo completo de sesión para obtener info de un Storage específico.
+    """
+    try:
+        # 1. ABRIR SESIÓN (TransactionID SIEMPRE 0)
+        print(f"\n--- [1] Abriendo Sesión para analizar {hex(storage_id)} ---")
+        pkt_open = build_ptp_packet(opcode=0x1002, transaction_id=0, params=[1])
+        send_ptp(dev, pkt_open)
+        res_open = receive_ptp(dev)
+        
+        if not res_open or res_open[6:8] != b'\x01\x20': # 0x2001 es OK (Little Endian)
+            print(f"Error al abrir sesión: {res_open.hex() if res_open else 'Sin respuesta'}")
+            return
+
+        # 2. PEDIR STORAGE INFO (TransactionID 1)
+        print(f"--- [2] Solicitando Info de {hex(storage_id)} ---")
+        pkt = build_ptp_packet(opcode=0x1005, transaction_id=1, params=[storage_id])
+        send_ptp(dev, pkt)
+        
+        # Leemos el Data Phase (Type 2)
+        data = receive_ptp(dev, size=1024)
+        
+        # Leemos el Response Phase (Type 3 - El OK final del comando)
+        status = receive_ptp(dev, size=12)
+
+        if data:
+            # Validamos si es un paquete de datos (Type 0x0002 en bytes 4-5)
+            if data[4:6] == b'\x02\x00':
+                print(f"Dataset recibido: {data.hex()}")
+                try:
+                    # El estándar dice: Offset 12 son 8 bytes para Max Capacity
+                    capacidad = struct.unpack("<Q", data[12:20])[0]
+                    print(f"Capacidad Total: {capacidad} bytes ({capacidad / (1024*1024):.2f} MB)")
+                except Exception as e:
+                    print(f"Error al parsear bytes: {e}")
+            else:
+                print(f"La cámara no mandó datos, mandó esto: {data.hex()}")
+
+        # 3. CERRAR SESIÓN (TransactionID 2)
+        print(f"--- [3] Cerrando Sesión ---")
+        pkt_close = build_ptp_packet(opcode=0x1003, transaction_id=2)
+        send_ptp(dev, pkt_close)
+        receive_ptp(dev)
+
+    except Exception as e:
+        print(f"Fallo crítico en check_storage_info: {e}")
+
+def test_final_nand(dev):
+    ID_NAND = 0x10001 # Cambiamos de 0x20001 a 0x10001
+    TAMANO_DUMMY = 512 # Probamos con solo un sector (512 bytes) para no saturar
     
     try:
-        dev.write(0x04, cmd)
+        # 1. Abrir sesión
+        print("\n--- [1] Abriendo sesión ---")
+        pkt_open = build_ptp_packet(0x1002, 0, [1])
+        send_ptp(dev, pkt_open)
+        receive_ptp(dev)
+
+        # 2. Intentar 0x900c en la NAND
+        print(f"--- [2] Test 0x900c en NAND ({hex(ID_NAND)}) ---")
+        pkt_command = build_ptp_packet(0x900c, 1, [ID_NAND, 0, 0])
+        send_ptp(dev, pkt_command)
         
-        # Leemos el Data Container completo
-        # El header es 12, así que leemos 12 + el tamaño de los datos
-        full_res = dev.read(0x83, 1024 + 12)
+        # Mandamos el header de datos + 512 bytes de estática (basura)
+        header_data = struct.pack("<IHH I", 12 + TAMANO_DUMMY, 2, 0x900c, 1)
+        basura = b'\xff\x00' * (TAMANO_DUMMY // 2)
         
-        header = full_res[:12]
-        ram_data = full_res[12:]
+        dev.write(0x04, header_data + basura)
         
-        print(f"Capturados {len(ram_data)} bytes de RAM.")
-        
-        with open("camOS_dump.bin", "wb") as f:
-            f.write(ram_data)
-            
-        # IMPORTANTE: Después del Data Container, la cámara MANDA UN RESPONSE (12 bytes)
-        # Hay que leerlo para "limpiar" el buffer USB
-        final_status = dev.read(0x83, 12)
-        print(f"Status final de la cámara: {final_status.tobytes().hex()}")
-        
+        print("Enviado. Esperando respuesta...")
+        res = receive_ptp(dev)
+        print("Respuesta de la cámara:", res.hex() if res else "Timeout")
+
     except Exception as e:
         print(f"Error: {e}")
+    finally:
+        # Intentar cerrar sesión para no dejar el puerto tomado
+        send_ptp(dev, build_ptp_packet(0x1003, 2))
+        receive_ptp(dev)
 
 if __name__ == "__main__":
 
     listarUsb()
     # getEndpoints(KODAK_ES_C813.IdVendor, KODAK_ES_C813.idProduct)
     camara = getDevice(KODAK_ES_C813.IdVendor,KODAK_ES_C813.idProduct)
-    #printDeviceInfo(camara)
-    #test_vendor_codes(camara)
-    dump_cam_os_segment(camara)
+    # printDeviceInfo(camara)
+    # ejecutar_test_storage(camara)
+    # check_storage_info(camara,0x10000)
+    test_final_nand(camara)
